@@ -363,7 +363,7 @@ tr.edge td { font-weight: 800; background: var(--brand-soft) }
   <header class="top">
     <div class="brand">
       <div class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7h15a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3V7z"/><path d="M3 7l12-4v4"/><circle cx="16.5" cy="13.5" r="1.4" fill="currentColor"/></svg></div>
-      <div><h1>Tetibola</h1><p>Budget de la famille · en Ariary · version locale</p></div>
+      <div><h1>Tetibola</h1><p>Budget de la famille · en Ariary · version perso</p></div>
     </div>
     <div class="month" aria-label="Mois affiché">
       <button id="prevM" aria-label="Mois précédent">‹</button>
@@ -524,23 +524,26 @@ function makeRemote(db) {
   };
 }
 function makeLocal() {
-  const KEY = "tetibola-local-v1";
+  const KEY = "tetibola-local-v1", COLLS = ["tx", "goals", "wallets", "loans", "bills"];
   let data = { tx: {}, settings: null, goals: {}, wallets: {}, loans: {}, bills: {} };
   try { const r = lsGet(KEY); if (r) data = Object.assign(data, JSON.parse(r)); } catch (e) {}
   const L = {}; let from = "";
-  const save = () => lsSet(KEY, JSON.stringify(data));
+  const save = () => { lsSet(KEY, JSON.stringify(data)); try { window.dispatchEvent(new Event("tb-local-change")); } catch (e) {} };
   const uid = () => Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
-  const rows = n => Object.entries(data[n]).map(([id, v]) => ({ id, ...v }));
+  const now = () => Date.now();
+  const rows = n => Object.entries(data[n] || {}).filter(([, v]) => !v._del).map(([id, v]) => ({ id, ...v }));
   const emit = n => { if (n === "tx") L.tx && L.tx(rows("tx").filter(t => t.date >= from)); else L[n] && L[n](rows(n)); };
   return {
     subTx(f, cb) { from = f; L.tx = cb; emit("tx"); },
     sub(n, cb) { L[n] = cb; emit(n); },
-    async add(n, d) { data[n][uid()] = d; save(); emit(n); },
-    async set(n, id, d) { data[n][id] = d; save(); emit(n); },
-    async del(n, id) { delete data[n][id]; save(); emit(n); },
+    async add(n, d) { data[n][uid()] = { ...d, _u: now() }; save(); emit(n); },
+    async set(n, id, d) { data[n][id] = { ...d, _u: now() }; save(); emit(n); },
+    async del(n, id) { data[n][id] = { _del: true, _u: now() }; save(); emit(n); },
     subSettings(cb) { L.s = cb; cb(data.settings); },
-    async saveSettings(d) { data.settings = d; save(); L.s && L.s(d); },
-    async mapWhere(n, field, value, fn) { let c = 0; for (const [id, v] of Object.entries(data[n] || {})) if (v[field] === value) { const pt = fn(v); if (pt) { data[n][id] = { ...v, ...pt }; c++; } } save(); emit(n); return c; }
+    async saveSettings(d) { data.settings = { ...d, _u: now() }; save(); L.s && L.s(data.settings); },
+    async mapWhere(n, field, value, fn) { let c = 0; for (const [id, v] of Object.entries(data[n] || {})) if (!v._del && v[field] === value) { const pt = fn(v); if (pt) { data[n][id] = { ...v, ...pt, _u: now() }; c++; } } save(); emit(n); return c; },
+    getData: () => data,
+    replaceData(d) { data = Object.assign({ tx: {}, settings: null, goals: {}, wallets: {}, loans: {}, bills: {} }, d); lsSet(KEY, JSON.stringify(data)); COLLS.forEach(emit); L.s && L.s(data.settings); }
   };
 }
 async function write(p, okMsg) {
@@ -943,6 +946,7 @@ const views = {
       <div class="card"><h2>Sauvegarde</h2><p class="small" id="dyn-share"></p>
         <div class="pickrow"><button type="button" data-act="share-backup" aria-pressed="true">Sauvegarder vers Google Drive / Gmail</button><button type="button" data-act="backup">Télécharger la sauvegarde (.json)</button><label class="btn ghost sm" for="restore-file" style="cursor:pointer">Importer une sauvegarde</label><input type="file" id="restore-file" accept=".json,application/json" hidden></div>
         <p class="small muted">Les catégories se gèrent dans l'onglet Catégories, les comptes dans Portefeuilles.</p></div>
+      <div class="card"><h2>Synchronisation Google Drive</h2><div id="dyn-gd"></div></div>
     </div>`,
     fill() {
       const m = $("#dyn-members"); if (!m) return;
@@ -988,9 +992,11 @@ function refresh() {
   views[state.tab].fill();
   const b = $("#banner");
   const msgs = [];
-  if (state.mode === "local") { const lb = Number(lsGet("tb-lastbackup") || 0); if (!lb || Date.now() - lb > 7 * 864e5) msgs.push((lb ? "Dernière sauvegarde il y a plus de 7 jours." : "Données enregistrées dans ce navigateur uniquement.") + ' <button class="btn primary sm" data-act="share-backup" style="margin-left:6px">Sauvegarder vers Google Drive</button>'); }
+  if (state.mode === "local") { const lb = Number(lsGet("tb-lastbackup") || 0); if (!gdOn() && (!lb || Date.now() - lb > 7 * 864e5)) msgs.push((lb ? "Dernière sauvegarde il y a plus de 7 jours." : "Données enregistrées dans ce navigateur uniquement.") + ' <button class="btn primary sm" data-act="share-backup" style="margin-left:6px">Sauvegarder vers Google Drive</button>'); }
   if (state.txCapped) msgs.push("Plus de 1 000 opérations sur la période chargée : les soldes peuvent être incomplets. Utilisez « Ajuster le solde » sur vos portefeuilles pour repartir d'une date récente.");
+  { const gm = gdBannerMsg(); if (gm) msgs.unshift(gm); }
   b.innerHTML = msgs.join(" "); b.hidden = !msgs.length;
+  const gdp = $("#dyn-gd"); if (gdp) gdp.innerHTML = gdPanel();
   if (state.wm && $("#wm-body")) renderWalletModal();
   const n = dueList(7).length, bd = $("#bills-badge");
   if (bd) { bd.textContent = n; bd.hidden = !n; bd.title = n + " échéance(s) sous 7 jours"; }
@@ -1667,6 +1673,10 @@ document.addEventListener("click", async e => {
     case "export": exportTx(); break;
     case "backup": backup(); break;
     case "share-backup": shareBackup(); break;
+    case "gd-connect": gdConnect(); break;
+    case "gd-sync": gdSync(); break;
+    case "gd-disconnect": gdDisconnect(); break;
+    case "gd-config": openGdConfig(); break;
     case "new-bill": openBill(null, b.dataset.type); break;
     case "edit-bill": { const x = find(state.bills); x && openBill(x); break; }
     case "settle-bill": { const x = find(state.bills); x && openSettle(x); break; }
@@ -1715,6 +1725,144 @@ document.addEventListener("submit", async e => {
   if (await write(store.saveSettings({ ...S(), [key]: [...arr, v] }), `« ${v} » ajouté`)) inp.value = "";
 });
 document.addEventListener("keydown", e => { if (e.key === "Escape" && !$("#overlay").hidden) closeDialog(); });
+
+/* ---------- Google Drive sync (version hébergée) ---------- */
+const GD_CLIENT_ID_EMBED = "__GD_CLIENT_ID__";
+const GD_FILE = "tetibola-donnees.json";
+const GD = { token: null, exp: 0, fileId: lsGet("tb-gd-file") || null, busy: false, again: false, applying: false, status: "", t: null };
+const gdClientId = () => (lsGet("tb-gd-client") || (GD_CLIENT_ID_EMBED.startsWith("__") ? "" : GD_CLIENT_ID_EMBED)).trim();
+const gdOn = () => !!lsGet("tb-gd-on") && !!gdClientId();
+const gdHosted = () => /^https?:$/.test(location.protocol);
+function gdLoadScript() {
+  return new Promise((res, rej) => {
+    if (window.google && google.accounts && google.accounts.oauth2) return res();
+    const sc = document.createElement("script"); sc.src = "https://accounts.google.com/gsi/client"; sc.async = true;
+    sc.onload = () => res(); sc.onerror = () => rej({ code: "script" }); document.head.appendChild(sc);
+  });
+}
+async function gdAuth(first) {
+  await gdLoadScript();
+  return new Promise((res, rej) => {
+    const tc = google.accounts.oauth2.initTokenClient({
+      client_id: gdClientId(), scope: "https://www.googleapis.com/auth/drive.file",
+      callback: r => { if (r.error) return rej({ code: "auth", detail: r.error }); GD.token = r.access_token; GD.exp = Date.now() + ((r.expires_in || 3600) - 90) * 1000; lsSet("tb-gd-on", "1"); res(); },
+      error_callback: e => rej({ code: "auth", detail: e && e.type })
+    });
+    tc.requestAccessToken({ prompt: first ? "consent" : "" });
+  });
+}
+async function gdFetch(url, opts = {}) {
+  const r = await fetch(url, { ...opts, headers: { ...(opts.headers || {}), Authorization: "Bearer " + GD.token } });
+  if (r.status === 401 || r.status === 403) { GD.token = null; throw { code: "auth" }; }
+  return r;
+}
+async function gdFindFile() {
+  if (GD.fileId) return GD.fileId;
+  const q = encodeURIComponent(`name='${GD_FILE}' and trashed=false`);
+  const r = await gdFetch(`https://www.googleapis.com/drive/v3/files?q=${q}&spaces=drive&orderBy=modifiedTime%20desc&fields=files(id,modifiedTime)`);
+  if (!r.ok) throw { code: "net" };
+  const j = await r.json();
+  GD.fileId = j.files && j.files[0] ? j.files[0].id : null;
+  if (GD.fileId) lsSet("tb-gd-file", GD.fileId);
+  return GD.fileId;
+}
+async function gdDownload(id) {
+  const r = await gdFetch(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`);
+  if (r.status === 404) { GD.fileId = null; lsSet("tb-gd-file", ""); return null; }
+  if (!r.ok) throw { code: "net" };
+  try { return await r.json(); } catch (e) { return null; }
+}
+async function gdUpload(obj) {
+  const body = JSON.stringify(obj);
+  if (GD.fileId) {
+    const r = await gdFetch(`https://www.googleapis.com/upload/drive/v3/files/${GD.fileId}?uploadType=media`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body });
+    if (r.ok) return;
+    if (r.status !== 404) throw { code: "net" };
+    GD.fileId = null;
+  }
+  const bd = "tetibola" + Date.now();
+  const meta = { name: GD_FILE, mimeType: "application/json", description: "Données de l'application Tetibola (budget familial). Ne pas modifier à la main." };
+  const mp = `--${bd}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(meta)}\r\n--${bd}\r\nContent-Type: application/json\r\n\r\n${body}\r\n--${bd}--`;
+  const r = await gdFetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id", { method: "POST", headers: { "Content-Type": "multipart/related; boundary=" + bd }, body: mp });
+  if (!r.ok) throw { code: "net" };
+  const j = await r.json(); GD.fileId = j.id; lsSet("tb-gd-file", j.id);
+}
+function mergeData(a, b) {
+  const out = { settings: null };
+  ["tx", "goals", "wallets", "loans", "bills"].forEach(n => {
+    out[n] = { ...((a && a[n]) || {}) };
+    Object.entries((b && b[n]) || {}).forEach(([id, v]) => { const cur = out[n][id]; if (!cur || (v._u || 0) > (cur._u || 0)) out[n][id] = v; });
+  });
+  const sa = a && a.settings, sb = b && b.settings;
+  out.settings = !sa ? sb || null : !sb ? sa : ((sb._u || 0) > (sa._u || 0) ? sb : sa);
+  return out;
+}
+function gdSetStatus(st) { GD.status = st; refresh(); }
+async function gdSync() {
+  if (!gdOn()) return;
+  if (GD.busy) { GD.again = true; return; }
+  if (!GD.token || Date.now() > GD.exp) { gdSetStatus("reconnect"); return; }
+  GD.busy = true; gdSetStatus("sync");
+  try {
+    const id = await gdFindFile();
+    const remote = id ? await gdDownload(id) : null;
+    const rData = remote && remote.data ? remote.data : null;
+    const local = store.getData();
+    const merged = rData ? mergeData(local, rData) : local;
+    if (JSON.stringify(merged) !== JSON.stringify(local)) { GD.applying = true; store.replaceData(merged); GD.applying = false; }
+    if (!rData || JSON.stringify(merged) !== JSON.stringify(rData)) await gdUpload({ app: "tetibola", version: 4, savedAt: new Date().toISOString(), data: merged });
+    lsSet("tb-gd-last", String(Date.now())); lsSet("tb-lastbackup", String(Date.now()));
+    GD.busy = false; gdSetStatus("ok");
+  } catch (e) {
+    GD.busy = false; GD.applying = false;
+    gdSetStatus(e && e.code === "auth" ? "reconnect" : "error");
+  }
+  if (GD.again) { GD.again = false; setTimeout(gdSync, 400); }
+}
+async function gdConnect() {
+  if (!gdHosted()) { toast("La synchronisation Google Drive fonctionne quand l'application est ouverte depuis son adresse https (GitHub Pages), pas depuis un fichier."); return; }
+  if (!gdClientId()) { openGdConfig(); return; }
+  try { await gdAuth(!lsGet("tb-gd-on")); toast("Connecté à Google Drive"); gdSync(); }
+  catch (e) { toast(e && e.code === "script" ? "Impossible de joindre Google. Vérifiez la connexion internet." : "Connexion Google annulée ou refusée."); gdSetStatus(lsGet("tb-gd-on") ? "reconnect" : ""); }
+}
+function gdDisconnect() {
+  try { if (GD.token && window.google) google.accounts.oauth2.revoke(GD.token, () => {}); } catch (e) {}
+  GD.token = null; lsSet("tb-gd-on", ""); gdSetStatus(""); toast("Google Drive déconnecté sur cet appareil. Les données restent dans le navigateur et dans Drive.");
+}
+function openGdConfig() {
+  const html = `<form id="dlgForm" novalidate><h2>ID client Google</h2>
+    <p class="small muted" style="margin:0">Collez l'« ID client » OAuth créé dans Google Cloud (il se termine par <code>.apps.googleusercontent.com</code>). Il est enregistré sur cet appareil ; faites-le aussi sur le téléphone, ou demandez à l'intégrer directement dans le fichier.</p>
+    <label class="field"><span>ID client</span><input id="gd-cid" name="cid" value="${esc(gdClientId())}" placeholder="123456789-abc.apps.googleusercontent.com" autocomplete="off"></label>${actions}</form>`;
+  openDialog(html, async fd => {
+    const v = String(fd.get("cid") || "").trim();
+    if (!/\.apps\.googleusercontent\.com$/.test(v)) return "Cet identifiant ne ressemble pas à un ID client Google (…apps.googleusercontent.com).";
+    lsSet("tb-gd-client", v); GD.token = null; toast("ID client enregistré"); refresh(); return true;
+  });
+}
+function gdPanel() {
+  const last = Number(lsGet("tb-gd-last") || 0);
+  const lastTxt = last ? new Date(last).toLocaleString("fr-FR", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" }) : "jamais";
+  if (!gdHosted()) return `<p class="small">Pour synchroniser ordinateur et téléphone, ouvrez l'application depuis son adresse en ligne (GitHub Pages), pas depuis un fichier téléchargé. Voir le guide d'installation.</p>`;
+  if (!gdClientId()) return `<p class="small">Enregistrez automatiquement vos données dans votre Google Drive et retrouvez-les sur tous vos appareils connectés au même compte Google.</p><div class="pickrow"><button type="button" data-act="gd-config" aria-pressed="true">Saisir l'ID client Google</button></div>`;
+  if (!lsGet("tb-gd-on")) return `<p class="small">ID client enregistré. Connectez votre compte Google pour activer la synchronisation.</p><div class="pickrow"><button type="button" data-act="gd-connect" aria-pressed="true">Se connecter à Google Drive</button><button type="button" data-act="gd-config">Modifier l'ID client</button></div>`;
+  const st = { sync: '<span class="pill info">Synchronisation…</span>', ok: '<span class="pill ok">À jour</span>', pending: '<span class="pill warn">Modifications en attente</span>', reconnect: '<span class="pill warn">Reconnexion nécessaire</span>', error: '<span class="pill over">Échec</span>' }[GD.status] || '<span class="pill neutral">Connecté</span>';
+  return `<p class="small">${st} Dernière synchronisation : <strong>${lastTxt}</strong>. Fichier Drive : <code>${GD_FILE}</code>.</p>
+    <div class="pickrow"><button type="button" data-act="${GD.token ? "gd-sync" : "gd-connect"}" aria-pressed="true">${GD.token ? "Synchroniser maintenant" : "Reconnecter Google Drive"}</button><button type="button" data-act="gd-disconnect">Déconnecter</button><button type="button" data-act="gd-config">Modifier l'ID client</button></div>
+    <p class="small muted">Chaque modification est envoyée vers Drive quelques secondes après la saisie, et les données de l'autre appareil sont récupérées toutes les minutes. Google demande de reconnecter environ une fois par heure d'utilisation (un clic).</p>`;
+}
+function gdBannerMsg() {
+  if (!gdOn() || !gdHosted()) return "";
+  if (GD.status === "reconnect" || !GD.token) return `Google Drive : reconnectez-vous pour synchroniser. <button class="btn primary sm" data-act="gd-connect" style="margin-left:6px">Reconnecter</button>`;
+  if (GD.status === "error") return `La synchronisation Google Drive a échoué (connexion internet ?). <button class="btn primary sm" data-act="gd-sync" style="margin-left:6px">Réessayer</button>`;
+  return "";
+}
+window.addEventListener("tb-local-change", () => {
+  if (GD.applying || !gdOn()) return;
+  clearTimeout(GD.t); GD.t = setTimeout(gdSync, 2500);
+  if (GD.token) GD.status = "pending";
+});
+setInterval(() => { if (document.visibilityState === "visible" && GD.token) gdSync(); }, 60000);
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible" && GD.token) gdSync(); });
 
 /* ---------- Boot ---------- */
 async function boot() {
